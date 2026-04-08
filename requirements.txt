@@ -5,3 +5,4 @@ schedule>=1.2.0
 python-dotenv>=1.0.0
 lxml>=5.0.0
 apscheduler>=3.10.0
+pytz>=2024.1
