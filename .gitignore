@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+copy_trading_bot/logs/
+copy_trading_bot/trades.db
+*.egg-info/
+.venv/
