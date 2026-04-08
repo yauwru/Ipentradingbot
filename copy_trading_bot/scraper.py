@@ -178,10 +178,11 @@ def _parse_trades_table(soup: BeautifulSoup, politician_name: str,
     trades = []
     table = soup.find("table")
     if not table:
-        logger.debug("[%s] Tidak ada <table> di halaman", bio_id)
+        logger.warning("[%s] Tidak ada <table> di halaman", bio_id)
         return trades
 
     rows = table.find_all("tr")
+    logger.info("[%s] Tabel ditemukan, %d baris", bio_id, len(rows))
     if len(rows) < 2:
         return trades
 
@@ -287,7 +288,7 @@ def get_politician_trades(bio_id: str, days_back: int = 30,
     return trades
 
 
-def get_all_recent_trades(politicians: list[dict], days_back: int = 30) -> list[dict]:
+def get_all_recent_trades(politicians: list[dict], days_back: int = 180) -> list[dict]:
     """Fetch trades dari semua politisi yang di-track."""
     all_trades: list[dict] = []
     seen_ids: set[str] = set()

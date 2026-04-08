@@ -44,7 +44,7 @@ def run_once() -> dict:
     # ------------------------------------------------------------------ #
     # 2. Fetch recent trades
     # ------------------------------------------------------------------ #
-    all_trades = scraper.get_all_recent_trades(politicians, days_back=30)
+    all_trades = scraper.get_all_recent_trades(politicians, days_back=180)
     logger.info("Scraped %d total trades", len(all_trades))
 
     # ------------------------------------------------------------------ #
