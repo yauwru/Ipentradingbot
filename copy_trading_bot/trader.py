@@ -153,7 +153,7 @@ def place_order(trade: dict) -> Optional[dict]:
     if side == OrderSide.BUY:
         # Pastikan cukup buying power
         acct = get_account_info()
-        if acct["buying_power"] < POSITION_SIZE_USD:
+        if acct["buying_power"] < POSITION_SIZE_USD * 0.95:
             logger.warning(
                 "Buying power $%.2f kurang dari position size $%.2f – skipping %s",
                 acct["buying_power"], POSITION_SIZE_USD, ticker,
