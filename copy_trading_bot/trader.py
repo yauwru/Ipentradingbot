@@ -147,29 +147,60 @@ def place_order(trade: dict) -> Optional[dict]:
             )
             return None
 
-    # Calculate quantity from POSITION_SIZE_USD
-    price = get_latest_price(ticker)
-    if price is None or price <= 0:
-        logger.warning("Could not get price for %s – skipping", ticker)
-        return None
+    client = get_client()
 
-    qty = max(1, int(POSITION_SIZE_USD / price))
-
-    # For sells, don't sell more than we own
-    if side == OrderSide.SELL:
-        positions = get_positions()
-        held = int(positions.get(ticker, {}).get("qty", 0))
-        qty = min(qty, held)
-        if qty <= 0:
-            logger.info("No shares of %s to sell", ticker)
+    # ── BUY: gunakan notional (dollar amount) → fractional shares ─────────
+    if side == OrderSide.BUY:
+        # Pastikan cukup buying power
+        acct = get_account_info()
+        if acct["buying_power"] < POSITION_SIZE_USD:
+            logger.warning(
+                "Buying power $%.2f kurang dari position size $%.2f – skipping %s",
+                acct["buying_power"], POSITION_SIZE_USD, ticker,
+            )
             return None
 
-    client = get_client()
+        try:
+            req = MarketOrderRequest(
+                symbol=ticker,
+                notional=round(POSITION_SIZE_USD, 2),
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+            order = client.submit_order(req)
+            result = {
+                "alpaca_order_id": str(order.id),
+                "ticker": ticker,
+                "side": trade_type,
+                "qty": 0,               # fractional, dikonfirmasi saat fill
+                "position_usd": POSITION_SIZE_USD,
+                "status": str(order.status),
+            }
+            logger.info(
+                "Order placed: BUY $%.2f of %s (fractional) – order %s",
+                POSITION_SIZE_USD, ticker, order.id,
+            )
+            return result
+        except Exception as exc:
+            logger.error("Failed to place BUY order for %s: %s", ticker, exc)
+            return None
+
+    # ── SELL: jual seluruh posisi yang dipegang ────────────────────────────
+    positions = get_positions()
+    pos = positions.get(ticker)
+    if not pos:
+        logger.info("SELL signal for %s but no position held – skipping", ticker)
+        return None
+
+    held_qty = float(pos["qty"])
+    if held_qty <= 0:
+        return None
+
     try:
         req = MarketOrderRequest(
             symbol=ticker,
-            qty=qty,
-            side=side,
+            qty=held_qty,
+            side=OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
         order = client.submit_order(req)
@@ -177,16 +208,15 @@ def place_order(trade: dict) -> Optional[dict]:
             "alpaca_order_id": str(order.id),
             "ticker": ticker,
             "side": trade_type,
-            "qty": qty,
-            "position_usd": qty * price,
+            "qty": held_qty,
+            "position_usd": float(pos["market_value"]),
             "status": str(order.status),
         }
         logger.info(
-            "Order placed: %s %d shares of %s @ ~$%.2f (order %s)",
-            trade_type.upper(), qty, ticker, price, order.id,
+            "Order placed: SELL %.4f shares of %s @ market – order %s",
+            held_qty, ticker, order.id,
         )
         return result
-
     except Exception as exc:
-        logger.error("Failed to place order for %s: %s", ticker, exc)
+        logger.error("Failed to place SELL order for %s: %s", ticker, exc)
         return None
