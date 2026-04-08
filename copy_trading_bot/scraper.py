@@ -1,10 +1,12 @@
 """
-Capitol Trades scraper.
+STOCK Act Trades Scraper.
 
-Capitol Trades adalah Next.js app — data trades ada di:
-  1. __NEXT_DATA__ JSON yang di-embed di HTML (SSR)
-  2. API endpoint internal: /api/trades
-  3. HTML parsing sebagai fallback terakhir
+Menggunakan data publik dari House & Senate STOCK Act disclosures:
+  - House: https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json
+  - Senate: https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json
+
+Data ini sama persis dengan yang ditampilkan Capitol Trades,
+langsung dari sumber resmi pemerintah AS.
 """
 
 import json
@@ -14,27 +16,45 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
-from bs4 import BeautifulSoup
 
-from copy_trading_bot.config import CAPITOL_TRADES_BASE_URL, HEADERS, TOP_POLITICIANS
+from copy_trading_bot.config import HEADERS, TOP_POLITICIANS
 
 logger = logging.getLogger(__name__)
+
+HOUSE_URL  = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
+SENATE_URL = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
+
+# Nama politisi yang ingin di-track (lowercase untuk matching)
+TRACKED_NAMES = [
+    "nancy pelosi",
+    "michael mccaul",
+    "josh gottheimer",
+    "dan crenshaw",
+    "tommy tuberville",
+    "brian mast",
+    "ro khanna",
+    "michael waltz",
+    "greg gianforte",
+    "virginia foxx",
+    "marjorie taylor greene",
+    "paul gosar",
+    "david rouzer",
+    "pete sessions",
+    "shelley moore capito",
+]
 
 
 # --------------------------------------------------------------------------- #
 # HTTP helper
 # --------------------------------------------------------------------------- #
 
-def _get(url: str, params: dict = None, retries: int = 3,
-         extra_headers: dict = None) -> Optional[requests.Response]:
-    """HTTP GET dengan retry dan polite delay."""
-    h = {**HEADERS, **(extra_headers or {})}
+def _get_json(url: str, retries: int = 3) -> Optional[list]:
     for attempt in range(retries):
         try:
-            time.sleep(1.5)
-            resp = requests.get(url, headers=h, params=params, timeout=15)
+            time.sleep(1)
+            resp = requests.get(url, headers=HEADERS, timeout=30)
             if resp.status_code == 200:
-                return resp
+                return resp.json()
             logger.warning("HTTP %s untuk %s", resp.status_code, url)
         except requests.RequestException as exc:
             logger.warning("Request error (attempt %s): %s", attempt + 1, exc)
@@ -43,41 +63,33 @@ def _get(url: str, params: dict = None, retries: int = 3,
 
 
 # --------------------------------------------------------------------------- #
-# Helpers untuk parsing
+# Helpers
 # --------------------------------------------------------------------------- #
 
 def _parse_amount(amount_str: str) -> float:
-    """'$1K – $15K' atau '$1,000 - $15,000' → midpoint dalam dollar."""
+    """'$15,001 - $50,000' → midpoint."""
     if not amount_str:
         return 0
     clean = amount_str.replace("$", "").replace(",", "").strip()
-    for sep in ("–", "-", "to"):
+    for sep in (" - ", "–", "-"):
         if sep in clean:
-            parts = [p.strip() for p in clean.split(sep, 1)]
-            vals = [_k_to_float(p) for p in parts if p.strip()]
+            parts = clean.split(sep, 1)
+            vals = []
+            for p in parts:
+                try:
+                    vals.append(float(p.strip()))
+                except ValueError:
+                    pass
             return sum(vals) / len(vals) if vals else 0
-    return _k_to_float(clean)
-
-
-def _k_to_float(s: str) -> float:
-    s = s.strip().upper().replace(",", "")
-    if not s:
-        return 0
-    if s.endswith("K"):
-        return float(s[:-1]) * 1_000
-    if s.endswith("M"):
-        return float(s[:-1]) * 1_000_000
-    if s.endswith("B"):
-        return float(s[:-1]) * 1_000_000_000
     try:
-        return float(s)
+        return float(clean)
     except ValueError:
         return 0
 
 
 def _parse_trade_type(raw: str) -> Optional[str]:
     raw = raw.lower().strip()
-    if any(k in raw for k in ("purchase", "buy", "bought")):
+    if any(k in raw for k in ("purchase", "buy", "bought", "exchange")):
         return "buy"
     if any(k in raw for k in ("sale", "sell", "sold")):
         return "sell"
@@ -85,10 +97,10 @@ def _parse_trade_type(raw: str) -> Optional[str]:
 
 
 def _parse_date(s: str) -> Optional[datetime]:
-    if not s:
+    if not s or s.strip() in ("", "N/A", "--"):
         return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%b %d, %Y", "%d %b %Y",
-                "%B %d, %Y", "%Y/%m/%d"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d",
+                "%b %d, %Y", "%B %d, %Y"):
         try:
             return datetime.strptime(s.strip(), fmt)
         except ValueError:
@@ -96,305 +108,139 @@ def _parse_date(s: str) -> Optional[datetime]:
     return None
 
 
+def _name_to_slug(name: str) -> str:
+    return name.lower().replace(" ", "-").replace(".", "").replace(",", "")
+
+
+def _is_tracked(name: str, tracked: list[str]) -> bool:
+    name_lower = name.lower().strip()
+    return any(t in name_lower or name_lower in t for t in tracked)
+
+
 # --------------------------------------------------------------------------- #
-# Politician discovery
+# Top politician discovery (dari nama yang aktif di data terbaru)
 # --------------------------------------------------------------------------- #
 
 def get_top_politicians(limit: int = 15) -> list[dict]:
     """
-    Fetch daftar politisi dari Capitol Trades.
-    Coba ambil dari __NEXT_DATA__, fallback ke link scraping.
+    Kembalikan daftar politisi yang di-track.
+    Selalu kembalikan hardcoded list + siapapun yang aktif di data terbaru.
     """
-    url = f"{CAPITOL_TRADES_BASE_URL}/politicians"
-    resp = _get(url)
-    if not resp:
-        logger.warning("Tidak bisa fetch halaman politicians, pakai hardcoded list.")
-        return [{"slug": s, "name": s.replace("-", " ").title()} for s in TOP_POLITICIANS]
-
     politicians = []
+    seen = set()
 
-    # ── Coba __NEXT_DATA__ JSON dulu ──────────────────────────────────────
-    soup = BeautifulSoup(resp.text, "lxml")
-    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-    if next_data_tag:
-        try:
-            data = json.loads(next_data_tag.string)
-            # Navigasi ke data politisi di pageProps
-            page_props = data.get("props", {}).get("pageProps", {})
-            # Capitol Trades menyimpan list di berbagai key
-            for key in ("politicians", "data", "items", "results"):
-                items = page_props.get(key, [])
-                if isinstance(items, list) and items:
-                    for item in items:
-                        slug = (item.get("bioguideId") or item.get("slug") or
-                                item.get("id") or "")
-                        name = (item.get("name") or item.get("displayName") or
-                                item.get("fullName") or str(slug))
-                        if slug:
-                            politicians.append({"slug": str(slug), "name": str(name)})
-                    if politicians:
-                        logger.info("Ditemukan %d politisi dari __NEXT_DATA__", len(politicians))
-                        break
-        except Exception as exc:
-            logger.debug("__NEXT_DATA__ parse error: %s", exc)
+    # Hardcoded top traders
+    for name in TRACKED_NAMES:
+        slug = _name_to_slug(name)
+        if slug not in seen:
+            seen.add(slug)
+            politicians.append({"slug": slug, "name": name.title()})
 
-    # ── Fallback: scrape link href ─────────────────────────────────────────
-    if not politicians:
-        seen = set()
-        for a in soup.select("a[href^='/politicians/']"):
-            href = a.get("href", "")
-            parts = href.strip("/").split("/")
-            if len(parts) >= 2:
-                slug = parts[1]
-                # Skip pagination dan filter links
-                if slug and slug not in seen and "?" not in slug and len(slug) > 2:
-                    seen.add(slug)
-                    name = a.get_text(strip=True) or slug.replace("-", " ").title()
-                    politicians.append({"slug": slug, "name": name})
-
-    # ── Merge dengan hardcoded list ────────────────────────────────────────
-    slugs_seen = {p["slug"] for p in politicians}
-    for s in TOP_POLITICIANS:
-        if s not in slugs_seen:
-            politicians.append({"slug": s, "name": s.replace("-", " ").title()})
-
-    logger.info("Total politisi yang akan di-track: %d", min(limit, len(politicians)))
+    logger.info("Tracking %d politisi", len(politicians))
     return politicians[:limit]
 
 
 # --------------------------------------------------------------------------- #
-# Trade scraping — tiga strategi
+# Fetch & filter trades
 # --------------------------------------------------------------------------- #
 
-def _trades_from_next_data(slug: str, html: str, cutoff: datetime) -> list[dict]:
-    """Strategi 1: Ekstrak trades dari __NEXT_DATA__ JSON."""
+def _process_house_trades(raw: list, cutoff: datetime, tracked: list[str]) -> list[dict]:
     trades = []
-    soup = BeautifulSoup(html, "lxml")
-    tag = soup.find("script", {"id": "__NEXT_DATA__"})
-    if not tag:
-        return trades
-
-    try:
-        data = json.loads(tag.string)
-        page_props = data.get("props", {}).get("pageProps", {})
-
-        # Capitol Trades menyimpan trades di berbagai key
-        raw_trades = []
-        for key in ("trades", "data", "items", "results", "recentTrades"):
-            val = page_props.get(key)
-            if isinstance(val, list) and val:
-                raw_trades = val
-                break
-            # Kadang nested satu level lagi
-            if isinstance(val, dict):
-                for sub_key in ("trades", "data", "items"):
-                    if isinstance(val.get(sub_key), list):
-                        raw_trades = val[sub_key]
-                        break
-
-        for item in raw_trades:
-            trade = _parse_trade_item(item, slug, cutoff)
-            if trade:
-                trades.append(trade)
-
-    except Exception as exc:
-        logger.debug("__NEXT_DATA__ trades parse error untuk %s: %s", slug, exc)
-
-    return trades
-
-
-def _trades_from_api(slug: str, cutoff: datetime) -> list[dict]:
-    """
-    Strategi 2: Capitol Trades internal API endpoints.
-    Coba beberapa format URL yang umum dipakai Next.js apps.
-    """
-    trades = []
-    api_headers = {
-        **HEADERS,
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{CAPITOL_TRADES_BASE_URL}/politicians/{slug}/trades",
-    }
-
-    candidate_urls = [
-        # Format API yang umum di Capitol Trades
-        f"{CAPITOL_TRADES_BASE_URL}/api/trades",
-        f"{CAPITOL_TRADES_BASE_URL}/api/v1/trades",
-        f"{CAPITOL_TRADES_BASE_URL}/_next/data/trades.json",
-    ]
-
-    candidate_params = [
-        {"politician": slug, "page": 1, "pageSize": 50},
-        {"politicianId": slug, "page": 1, "limit": 50},
-        {"slug": slug, "page": 1},
-    ]
-
-    for url in candidate_urls:
-        for params in candidate_params:
-            resp = _get(url, params=params, retries=1, extra_headers=api_headers)
-            if not resp:
-                continue
-            try:
-                payload = resp.json()
-                # Navigasi ke list trades
-                items = None
-                if isinstance(payload, list):
-                    items = payload
-                elif isinstance(payload, dict):
-                    for key in ("trades", "data", "items", "results"):
-                        if isinstance(payload.get(key), list):
-                            items = payload[key]
-                            break
-
-                if items:
-                    for item in items:
-                        trade = _parse_trade_item(item, slug, cutoff)
-                        if trade:
-                            trades.append(trade)
-                    if trades:
-                        logger.info("API berhasil untuk %s: %d trades", slug, len(trades))
-                        return trades
-            except Exception:
-                continue
-
-    return trades
-
-
-def _parse_trade_item(item: dict, slug: str, cutoff: datetime) -> Optional[dict]:
-    """
-    Parse satu item trade dari JSON (bisa dari __NEXT_DATA__ atau API).
-    Capitol Trades menggunakan field names yang beragam.
-    """
-    if not isinstance(item, dict):
-        return None
-
-    # ── Ticker ────────────────────────────────────────────────────────────
-    ticker = (
-        item.get("ticker") or item.get("symbol") or item.get("issuerTicker") or
-        item.get("asset", {}).get("ticker") if isinstance(item.get("asset"), dict) else None or
-        ""
-    )
-    if not ticker:
-        # Coba dari nested issuer
-        issuer = item.get("issuer") or {}
-        if isinstance(issuer, dict):
-            ticker = issuer.get("ticker") or issuer.get("symbol") or ""
-    ticker = str(ticker).strip().upper()
-    if not ticker or len(ticker) > 6:
-        return None
-
-    # ── Trade type ────────────────────────────────────────────────────────
-    type_raw = (
-        item.get("type") or item.get("tradeType") or item.get("transactionType") or
-        item.get("transaction") or item.get("action") or ""
-    )
-    trade_type = _parse_trade_type(str(type_raw))
-    if not trade_type:
-        return None
-
-    # ── Trade date ────────────────────────────────────────────────────────
-    date_raw = (
-        item.get("tradeDate") or item.get("transactionDate") or
-        item.get("reportDate") or item.get("date") or item.get("filedAt") or ""
-    )
-    trade_date = _parse_date(str(date_raw))
-    if not trade_date or trade_date < cutoff:
-        return None
-
-    # ── Amount ────────────────────────────────────────────────────────────
-    amount_raw = (
-        item.get("amount") or item.get("value") or item.get("tradeSize") or
-        item.get("size") or ""
-    )
-    amount_usd = _parse_amount(str(amount_raw)) if amount_raw else 0
-
-    # ── Asset type ────────────────────────────────────────────────────────
-    asset_type_raw = str(
-        item.get("assetType") or item.get("type") or
-        item.get("instrumentType") or ""
-    ).lower()
-    asset_type = "option" if "option" in asset_type_raw else "stock"
-
-    # ── Politician name ───────────────────────────────────────────────────
-    pol = item.get("politician") or {}
-    if isinstance(pol, dict):
-        pol_name = pol.get("name") or pol.get("displayName") or slug.replace("-", " ").title()
-    else:
-        pol_name = slug.replace("-", " ").title()
-
-    trade_id = f"{slug}_{ticker}_{trade_type}_{trade_date.strftime('%Y%m%d')}_{int(amount_usd)}"
-
-    return {
-        "politician": pol_name,
-        "slug": slug,
-        "ticker": ticker,
-        "trade_type": trade_type,
-        "trade_date": trade_date.strftime("%Y-%m-%d"),
-        "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
-        "amount_usd": amount_usd,
-        "asset_type": asset_type,
-        "trade_id": trade_id,
-    }
-
-
-def _trades_from_html(slug: str, html: str, cutoff: datetime) -> list[dict]:
-    """Strategi 3: Parse HTML secara langsung (last resort)."""
-    trades = []
-    soup = BeautifulSoup(html, "lxml")
-
-    rows = (
-        soup.select("table tbody tr") or
-        soup.select("tr[class*='trade']") or
-        soup.select("div[class*='trade-row']") or
-        soup.find_all("tr")
-    )
-
-    for row in rows:
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 4:
+    for item in raw:
+        if not isinstance(item, dict):
             continue
 
-        text = [c.get_text(" ", strip=True) for c in cells]
-        ticker = trade_type_raw = trade_date_str = amount_str = ""
-        asset_type = "stock"
-
-        for t in text:
-            t_clean = t.strip()
-            if not ticker and t_clean.isupper() and 1 <= len(t_clean) <= 5 and t_clean.isalpha():
-                ticker = t_clean
-            if not trade_type_raw and _parse_trade_type(t_clean):
-                trade_type_raw = t_clean
-            if not trade_date_str and _parse_date(t_clean):
-                trade_date_str = t_clean
-            if "$" in t_clean:
-                amount_str = t_clean
-            if "option" in t_clean.lower():
-                asset_type = "option"
-
-        if not ticker or not trade_type_raw:
+        name = str(item.get("representative") or "").strip()
+        if not name or not _is_tracked(name, tracked):
             continue
 
-        trade_type = _parse_trade_type(trade_type_raw)
-        trade_date = _parse_date(trade_date_str)
-
-        if not trade_type or not trade_date or trade_date < cutoff:
+        ticker = str(item.get("ticker") or "").strip().upper()
+        # Skip non-ticker entries
+        if not ticker or ticker in ("", "--", "N/A") or len(ticker) > 6:
+            continue
+        # Skip options (contain spaces or slashes)
+        if " " in ticker or "/" in ticker:
             continue
 
-        amount_usd = _parse_amount(amount_str)
+        trade_date = _parse_date(str(item.get("transaction_date") or ""))
+        if not trade_date or trade_date < cutoff:
+            continue
+
+        trade_type = _parse_trade_type(str(item.get("type") or ""))
+        if not trade_type:
+            continue
+
+        amount_usd = _parse_amount(str(item.get("amount") or ""))
+        asset_desc = str(item.get("asset_description") or "").lower()
+        asset_type = "option" if "option" in asset_desc else "stock"
+
+        slug = _name_to_slug(name)
         trade_id = f"{slug}_{ticker}_{trade_type}_{trade_date.strftime('%Y%m%d')}_{int(amount_usd)}"
 
         trades.append({
-            "politician": slug.replace("-", " ").title(),
+            "politician": name,
             "slug": slug,
             "ticker": ticker,
             "trade_type": trade_type,
             "trade_date": trade_date.strftime("%Y-%m-%d"),
-            "report_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "report_date": str(item.get("disclosure_date") or datetime.utcnow().strftime("%Y-%m-%d")),
             "amount_usd": amount_usd,
             "asset_type": asset_type,
             "trade_id": trade_id,
+            "source": "house",
         })
+    return trades
 
+
+def _process_senate_trades(raw: list, cutoff: datetime, tracked: list[str]) -> list[dict]:
+    trades = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        # Senate data structure berbeda sedikit
+        first = str(item.get("first_name") or "").strip()
+        last  = str(item.get("last_name") or "").strip()
+        name  = f"{first} {last}".strip() if (first or last) else str(item.get("senator") or "").strip()
+
+        if not name or not _is_tracked(name, tracked):
+            continue
+
+        ticker = str(item.get("ticker") or "").strip().upper()
+        if not ticker or ticker in ("", "--", "N/A") or len(ticker) > 6:
+            continue
+        if " " in ticker or "/" in ticker:
+            continue
+
+        trade_date = _parse_date(str(item.get("transaction_date") or
+                                     item.get("date") or ""))
+        if not trade_date or trade_date < cutoff:
+            continue
+
+        trade_type = _parse_trade_type(str(item.get("type") or
+                                          item.get("transaction_type") or ""))
+        if not trade_type:
+            continue
+
+        amount_usd = _parse_amount(str(item.get("amount") or ""))
+        asset_desc = str(item.get("asset_description") or "").lower()
+        asset_type = "option" if "option" in asset_desc else "stock"
+
+        slug = _name_to_slug(name)
+        trade_id = f"{slug}_{ticker}_{trade_type}_{trade_date.strftime('%Y%m%d')}_{int(amount_usd)}"
+
+        trades.append({
+            "politician": name,
+            "slug": slug,
+            "ticker": ticker,
+            "trade_type": trade_type,
+            "trade_date": trade_date.strftime("%Y-%m-%d"),
+            "report_date": str(item.get("disclosure_date") or datetime.utcnow().strftime("%Y-%m-%d")),
+            "amount_usd": amount_usd,
+            "asset_type": asset_type,
+            "trade_id": trade_id,
+            "source": "senate",
+        })
     return trades
 
 
@@ -403,50 +249,47 @@ def _trades_from_html(slug: str, html: str, cutoff: datetime) -> list[dict]:
 # --------------------------------------------------------------------------- #
 
 def get_politician_trades(slug: str, days_back: int = 7) -> list[dict]:
+    """Tidak dipakai langsung — pakai get_all_recent_trades()."""
+    return []
+
+
+def get_all_recent_trades(politicians: list[dict], days_back: int = 30) -> list[dict]:
     """
-    Ambil trades terbaru untuk satu politisi.
-    Coba tiga strategi secara berurutan:
-      1. __NEXT_DATA__ JSON dari halaman trades
-      2. Capitol Trades internal API
-      3. HTML parsing biasa
+    Fetch semua trades terbaru dari House & Senate STOCK Act data.
+    days_back=30 karena disclosure biasanya delay 30-45 hari dari tanggal transaksi.
     """
-    url = f"{CAPITOL_TRADES_BASE_URL}/politicians/{slug}/trades"
-    cutoff = datetime.utcnow() - timedelta(days=days_back)
+    cutoff  = datetime.utcnow() - timedelta(days=days_back)
+    tracked = [p["name"].lower() for p in politicians] + TRACKED_NAMES
 
-    resp = _get(url)
-    if not resp:
-        logger.warning("Tidak bisa fetch halaman trades untuk %s", slug)
-        return []
+    all_trades: list[dict] = []
 
-    html = resp.text
-
-    # Strategi 1: __NEXT_DATA__
-    trades = _trades_from_next_data(slug, html, cutoff)
-    if trades:
-        logger.info("[%s] %d trades dari __NEXT_DATA__", slug, len(trades))
-        return trades
-
-    # Strategi 2: API endpoint
-    trades = _trades_from_api(slug, cutoff)
-    if trades:
-        logger.info("[%s] %d trades dari API", slug, len(trades))
-        return trades
-
-    # Strategi 3: HTML parsing
-    trades = _trades_from_html(slug, html, cutoff)
-    if trades:
-        logger.info("[%s] %d trades dari HTML parsing", slug, len(trades))
+    # ── House trades ──────────────────────────────────────────────────────
+    logger.info("Fetching House STOCK Act data...")
+    house_raw = _get_json(HOUSE_URL)
+    if house_raw:
+        house_trades = _process_house_trades(house_raw, cutoff, tracked)
+        logger.info("House: %d trades ditemukan untuk politisi yang di-track", len(house_trades))
+        all_trades.extend(house_trades)
     else:
-        logger.warning("[%s] 0 trades ditemukan dari semua strategi", slug)
+        logger.warning("Gagal fetch House data")
 
-    return trades
+    # ── Senate trades ─────────────────────────────────────────────────────
+    logger.info("Fetching Senate STOCK Act data...")
+    senate_raw = _get_json(SENATE_URL)
+    if senate_raw:
+        senate_trades = _process_senate_trades(senate_raw, cutoff, tracked)
+        logger.info("Senate: %d trades ditemukan untuk politisi yang di-track", len(senate_trades))
+        all_trades.extend(senate_trades)
+    else:
+        logger.warning("Gagal fetch Senate data")
 
+    # Dedup by trade_id (kalau ada duplikat antar source)
+    seen_ids: set[str] = set()
+    unique_trades = []
+    for t in all_trades:
+        if t["trade_id"] not in seen_ids:
+            seen_ids.add(t["trade_id"])
+            unique_trades.append(t)
 
-def get_all_recent_trades(politicians: list[dict], days_back: int = 7) -> list[dict]:
-    """Ambil trades terbaru dari semua politisi."""
-    all_trades = []
-    for pol in politicians:
-        trades = get_politician_trades(pol["slug"], days_back=days_back)
-        all_trades.extend(trades)
-    logger.info("Total trades dari semua politisi: %d", len(all_trades))
-    return all_trades
+    logger.info("Total trades unik: %d (dari %d raw)", len(unique_trades), len(all_trades))
+    return unique_trades
