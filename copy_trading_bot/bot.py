@@ -9,10 +9,10 @@ On each run:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from copy_trading_bot import scraper, tracker, trader
-from copy_trading_bot.config import COPY_OPTIONS
+from copy_trading_bot.config import COPY_OPTIONS, TRADE_EXECUTION_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +55,13 @@ def run_once() -> dict:
     orders_skipped = 0
     orders_failed = 0
 
+    execution_cutoff = datetime.utcnow() - timedelta(days=TRADE_EXECUTION_DAYS)
+
     for trade in all_trades:
         # Skip options if not enabled
         if trade.get("asset_type") == "option" and not COPY_OPTIONS:
-            orders_skipped += 1
             tracker.mark_seen(trade)
+            orders_skipped += 1
             continue
 
         # Deduplicate
@@ -68,6 +70,21 @@ def run_once() -> dict:
 
         trades_new += 1
         tracker.mark_seen(trade)
+
+        # Hanya eksekusi order untuk trades yang cukup baru
+        try:
+            trade_date = datetime.strptime(trade["trade_date"], "%Y-%m-%d")
+        except ValueError:
+            trade_date = datetime.utcnow()
+
+        if trade_date < execution_cutoff:
+            logger.info(
+                "Old trade (>%dd): %s %s %s – mark seen, skip order",
+                TRADE_EXECUTION_DAYS,
+                trade["politician"], trade["trade_type"].upper(), trade["ticker"],
+            )
+            orders_skipped += 1
+            continue
 
         logger.info(
             "New trade: %s %s %s (reported $%.0f, date %s)",

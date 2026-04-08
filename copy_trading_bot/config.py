@@ -18,6 +18,10 @@ MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "20"))
 COPY_OPTIONS = os.getenv("COPY_OPTIONS", "false").lower() == "true"
 MIN_TRADE_AMOUNT = float(os.getenv("MIN_TRADE_AMOUNT", "1000"))
 
+# Hanya eksekusi order untuk trades yang dilaporkan dalam N hari terakhir.
+# Scraping tetap 180 hari (untuk mark-as-seen), tapi order hanya untuk yang baru.
+TRADE_EXECUTION_DAYS = int(os.getenv("TRADE_EXECUTION_DAYS", "14"))
+
 # Top politicians to track (slug from capitoltrades.com)
 # These are politicians with historically strong trading records.
 # The bot also discovers new top performers dynamically.
